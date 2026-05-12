@@ -1,0 +1,23 @@
+local:
+last_sync_at: datetime
+local_data_for_conversation_and_message
+
+db:
+conversation_user{
+	user_id: int, -> index
+	conversation_id: int,
+}
+
+conversation{
+	last_update_at: datetime, -> index
+	is_group: bool,
+}
+
+message{
+	conversation_id: int, -> index
+	content: json,
+	sender_id: int,
+	status: int,
+	type: enum,
+}
+
