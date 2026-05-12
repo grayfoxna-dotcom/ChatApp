@@ -6,6 +6,7 @@
 /public/uploads
 /public/rizz
 /storage/*.key
+/storage/app/public/avatars
 /vendor
 .env
 .env.backup
