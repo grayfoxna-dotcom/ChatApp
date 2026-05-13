@@ -120,12 +120,19 @@ class MessageController extends Controller
                 // 2. Hoặc là cuộc hội thoại mới tinh (chưa từng xóa - cleared_at == null)
                 // Điều này giúp ẩn hội thoại đã xóa sạch lịch sử giống Messenger.
                 return $conv['last_message'] != null || $conv['last_read_id'] === null;
-            })->sortByDesc('last_update_at')->values();
+            })->sort(function($a, $b) {
+                $timeA = $a['last_message'] ? $a['last_message']['created_at'] : ($a['last_update_at'] ?? '0000-00-00T00:00:00Z');
+                $timeB = $b['last_message'] ? $b['last_message']['created_at'] : ($b['last_update_at'] ?? '0000-00-00T00:00:00Z');
+                return strcmp($timeB, $timeA); // Sắp xếp giảm dần
+            })->values();
 
             return response()->json([
                 'status_response' => 'success',
                 'message_response' => 'Lấy danh sách hội thoại thành công',
-                'data' => $formatted
+                'data' => [
+                    'conversations' => $formatted,
+                    'server_time'   => now()->toIso8601String(),
+                ]
             ]);
         } catch (\Exception $e) {
             \Log::error("Lỗi getConversations: " . $e->getMessage());
@@ -179,50 +186,12 @@ class MessageController extends Controller
                 })
                 ->with(['sender', 'replyTo.sender']);
 
-            if ($aroundId) {
-                // TRƯỜNG HỢP 1: Lấy tin nhắn xung quanh một ID (Anchor)
-                // Hỗ trợ lấy lệch (ví dụ: 10 tin trên, 3 tin dưới)
-                $beforeLimit = $request->input('before_limit');
-                $afterLimit = $request->input('after_limit');
-
-                if ($beforeLimit !== null && $afterLimit !== null) {
-                    $olderLimit = intval($beforeLimit);
-                    $newerLimit = intval($afterLimit);
-                } else {
-                    $halfLimit = floor($limit / 2);
-                    $olderLimit = $halfLimit;
-                    $newerLimit = $halfLimit;
-                }
-                
-                $olderMessages = (clone $baseQuery)
-                    ->where('id', '<=', $aroundId)
-                    ->latest('id')
-                    ->take($olderLimit + 1) // Lấy tin mục tiêu + các tin cũ hơn
-                    ->get();
-
-                $newerMessages = (clone $baseQuery)
-                    ->where('id', '>', $aroundId)
-                    ->oldest('id')
-                    ->take($newerLimit) // Lấy các tin mới hơn
-                    ->get();
-
-                $messages = $olderMessages->merge($newerMessages)->sortBy('id')->values();
-            } elseif ($afterId) {
-                // TRƯỜNG HỢP 2: Lấy tin nhắn mới hơn (Cuộn xuống)
-                $messages = $baseQuery->where('id', '>', $afterId)
-                    ->oldest('id')
-                    ->take($limit)
-                    ->get()
-                    ->sortBy('id')
-                    ->values();
-            } else {
-                // TRƯỜNG HỢP 3: Lấy tin nhắn cũ hơn (Mặc định hoặc Cuộn lên)
-                $query = $baseQuery->latest('id');
-                if ($beforeId) {
-                    $query->where('id', '<', $beforeId);
-                }
-                $messages = $query->take($limit)->get()->sortBy('id')->values();
+            // Lấy tin nhắn cũ hơn (Mặc định hoặc Cuộn lên)
+            $query = $baseQuery->latest('id');
+            if ($beforeId) {
+                $query->where('id', '<', $beforeId);
             }
+            $messages = $query->take($limit)->get()->sortBy('id')->values();
 
             $formatted = $messages->map(function ($message) {
                 $replyData = null;
@@ -247,6 +216,7 @@ class MessageController extends Controller
                     'type' => $message->type,
                     'reply_to_id' => $message->reply_to_id,
                     'reply_to' => $replyData,
+                    'temp_id' => $message->temp_id,
                     'deleted_at' => $message->deleted_at ? $message->deleted_at->toIso8601String() : null,
                     'created_at' => $message->created_at->toIso8601String(),
                 ];
@@ -332,6 +302,7 @@ class MessageController extends Controller
                     'type'           => $message->type,
                     'reply_to_id'    => $message->reply_to_id,
                     'reply_to'       => $replyData,
+                    'temp_id'        => $message->temp_id,
                     'deleted_at'     => $message->deleted_at ? $message->deleted_at->toIso8601String() : null,
                     'created_at'     => $message->created_at->toIso8601String(),
                     'updated_at'     => $message->updated_at->toIso8601String(),
@@ -765,11 +736,56 @@ class MessageController extends Controller
                 ]);
             }
 
-            // Lưu trạng thái đã xóa cho người dùng hiện tại
-            \App\Models\MessageDeletion::firstOrCreate([
-                'message_id' => $messageId,
-                'user_id' => $user->id
-            ]);
+            // Thực hiện toàn bộ logic trong một Transaction để đảm bảo tính nguyên tử
+            DB::transaction(function() use ($messageId, $user) {
+                // 1. Lưu trạng thái đã xóa cho người dùng hiện tại
+                \App\Models\MessageDeletion::firstOrCreate([
+                    'message_id' => $messageId,
+                    'user_id' => $user->id
+                ]);
+
+                // 2. Logic tối ưu: Kiểm tra nếu tất cả thành viên đều đã xóa thì xóa cứng tin nhắn
+                $message = \App\Models\Message::find($messageId);
+                if ($message) {
+                    $conversation = $message->conversation;
+                    if ($conversation) {
+                        $totalParticipants = $conversation->users()->count();
+                        // Đếm số người đã xóa (bao gồm cả bản ghi vừa tạo ở bước 1)
+                        $deletedCount = \App\Models\MessageDeletion::where('message_id', $messageId)->count();
+
+                        if ($deletedCount >= $totalParticipants) {
+                            // a. Xóa các tệp vật lý kèm theo tin nhắn (nếu có)
+                            try {
+                                $content = $message->content;
+                                if (is_array($content)) {
+                                    $paths = [];
+                                    if (isset($content['file'])) $paths[] = $content['file'];
+                                    if (isset($content['files']) && is_array($content['files'])) {
+                                        $paths = array_merge($paths, $content['files']);
+                                    }
+
+                                    foreach ($paths as $path) {
+                                        $fullPath = public_path($path);
+                                        if (file_exists($fullPath) && is_file($fullPath)) {
+                                            unlink($fullPath);
+                                        }
+                                    }
+                                }
+                            } catch (\Exception $fe) {
+                                \Log::error("Lỗi xóa tệp khi Hard Delete: " . $fe->getMessage());
+                            }
+
+                            // b. Xóa các bản ghi đánh dấu xóa của tin nhắn này
+                            \App\Models\MessageDeletion::where('message_id', $messageId)->delete();
+                            
+                            // c. Xóa hẳn tin nhắn khỏi Database
+                            $message->delete();
+                            
+                            \Log::info("Đã xóa vĩnh viễn tin nhắn và tệp ID: $messageId do tất cả thành viên đều xóa.");
+                        }
+                    }
+                }
+            });
 
             return response()->json([
                 'status_response' => 'success',
@@ -904,14 +920,74 @@ class MessageController extends Controller
             // Lấy ID tin nhắn mới nhất hiện tại để đánh dấu đã xem hết khi xóa
             $lastMessageId = Message::where('conversation_id', $conversationId)->max('id');
 
-            // Cập nhật cleared_at và last_read_id cho người dùng hiện tại
-            DB::table('conversation_user')
-                ->where('user_id', $user->id)
-                ->where('conversation_id', $conversationId)
-                ->update([
-                    'cleared_at' => now(),
-                    'last_read_id' => $lastMessageId
-                ]);
+            // Sử dụng Transaction để đảm bảo tính nguyên tử
+            DB::transaction(function() use ($user, $conversationId, $lastMessageId) {
+                // 1. Cập nhật cleared_at và last_read_id cho người dùng hiện tại
+                DB::table('conversation_user')
+                    ->where('user_id', $user->id)
+                    ->where('conversation_id', $conversationId)
+                    ->update([
+                        'cleared_at' => now(),
+                        'last_read_id' => $lastMessageId
+                    ]);
+
+                // 2. Kiểm tra xem tất cả thành viên đã xóa lịch sử chưa
+                $participants = DB::table('conversation_user')
+                    ->where('conversation_id', $conversationId)
+                    ->get(['cleared_at']);
+
+                $allCleared = true;
+                $minClearedAt = now();
+
+                foreach ($participants as $p) {
+                    if (is_null($p->cleared_at)) {
+                        $allCleared = false;
+                        break;
+                    }
+                    $clearedTime = \Carbon\Carbon::parse($p->cleared_at);
+                    if ($clearedTime->lt($minClearedAt)) {
+                        $minClearedAt = $clearedTime;
+                    }
+                }
+
+                // 3. Nếu tất cả đều đã xóa, thực hiện dọn dẹp tin nhắn cũ vĩnh viễn
+                if ($allCleared) {
+                    $messagesToDelete = Message::where('conversation_id', $conversationId)
+                        ->where('created_at', '<=', $minClearedAt)
+                        ->get();
+
+                    foreach ($messagesToDelete as $msg) {
+                        try {
+                            // Xóa tệp vật lý
+                            $content = $msg->content;
+                            if (is_array($content)) {
+                                $paths = [];
+                                if (isset($content['file'])) $paths[] = $content['file'];
+                                if (isset($content['files']) && is_array($content['files'])) {
+                                    $paths = array_merge($paths, $content['files']);
+                                }
+
+                                foreach ($paths as $path) {
+                                    $fullPath = public_path($path);
+                                    if (file_exists($fullPath) && is_file($fullPath)) {
+                                        unlink($fullPath);
+                                    }
+                                }
+                            }
+                        } catch (\Exception $fe) {
+                            \Log::error("Lỗi xóa tệp trong clearConversation: " . $fe->getMessage());
+                        }
+
+                        // Xóa các bản ghi liên quan và tin nhắn
+                        \App\Models\MessageDeletion::where('message_id', $msg->id)->delete();
+                        $msg->delete();
+                    }
+
+                    if ($messagesToDelete->count() > 0) {
+                        \Log::info("Đã dọn dẹp vĩnh viễn " . $messagesToDelete->count() . " tin nhắn trong hội thoại $conversationId.");
+                    }
+                }
+            });
 
             return response()->json([
                 'status_response' => 'success',

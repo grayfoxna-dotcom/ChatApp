@@ -15,6 +15,7 @@ class Message extends Model
         'sender_id',
         'type',
         'reply_to_id',
+        'temp_id',
         'deleted_at'
     ];
 

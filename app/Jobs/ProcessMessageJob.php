@@ -81,6 +81,7 @@ class ProcessMessageJob implements ShouldQueue
                     'content' => $this->contentData,
                     'type' => $this->determinedType,
                     'reply_to_id' => $this->replyToId,
+                    'temp_id' => $this->tempId,
                 ]);
 
                 // 4. Cập nhật thời gian hoạt động cuối của hội thoại
